@@ -1,0 +1,14 @@
+{
+  "assignee": null,
+  "claim_note": "",
+  "claimed_at": null,
+  "created_at": "2026-04-10T17:30:29.425166Z",
+  "depends_on": [],
+  "epic": "fn-1-discord-orchestrator-bot-for-claude",
+  "id": "fn-1-discord-orchestrator-bot-for-claude.1",
+  "priority": null,
+  "spec_path": ".flow/tasks/fn-1-discord-orchestrator-bot-for-claude.1.md",
+  "status": "todo",
+  "title": "Project scaffolding, config, and tmux session manager",
+  "updated_at": "2026-04-10T17:30:52.697579Z"
+}

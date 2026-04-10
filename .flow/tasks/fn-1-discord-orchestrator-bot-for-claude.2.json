@@ -1,0 +1,16 @@
+{
+  "assignee": null,
+  "claim_note": "",
+  "claimed_at": null,
+  "created_at": "2026-04-10T17:30:35.517883Z",
+  "depends_on": [
+    "fn-1-discord-orchestrator-bot-for-claude.1"
+  ],
+  "epic": "fn-1-discord-orchestrator-bot-for-claude",
+  "id": "fn-1-discord-orchestrator-bot-for-claude.2",
+  "priority": null,
+  "spec_path": ".flow/tasks/fn-1-discord-orchestrator-bot-for-claude.2.md",
+  "status": "todo",
+  "title": "Bidirectional pipe with rate-limit-safe output",
+  "updated_at": "2026-04-10T17:31:04.524716Z"
+}
