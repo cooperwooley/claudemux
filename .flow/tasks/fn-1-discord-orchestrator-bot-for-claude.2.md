@@ -30,9 +30,23 @@ The async bidirectional pipe engine that bridges tmux panes and Discord channels
 - [ ] Polling task created/cancelled cleanly per session lifecycle
 - [ ] Handles tmux session death gracefully (notifies channel)
 ## Done summary
-TBD
+## Task .2 Complete: Bidirectional Pipe
 
+**Files created:** `discord_claude/pipe.py`
+
+**Features:**
+- `strip_ansi()` — comprehensive regex covering CSI, OSC, SGR, charset sequences
+- `chunk_output()` — splits at ~1900 chars with code block formatting
+- `SessionPipe` — full async bidirectional bridge:
+  - Output polling via `_poll_loop` with diff-based change detection
+  - Edit-in-place: maintains one "live" Discord message, edits on timer
+  - Finalizes after quiet_timeout (3s) of no new output
+  - Input queue with sequential delivery (prevents interleaving)
+  - Session death detection and notification
+- `PipeRegistry` — lookup by channel_id or session_name, clean teardown
+
+**Verified:** ANSI stripping, chunking, imports, registry operations all tested.
 ## Evidence
 - Commits:
-- Tests:
+- Tests: ANSI stripping (CSI, OSC, SGR), chunk_output short/long/empty, SessionPipe+PipeRegistry import, Registry lookup/create
 - PRs:
