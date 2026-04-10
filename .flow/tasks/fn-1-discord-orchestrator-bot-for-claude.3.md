@@ -30,9 +30,22 @@ The Discord bot itself: client setup, slash commands, channel/category managemen
 - [ ] Commands use defer() + followup for long operations
 - [ ] tree.sync() called once in setup_hook (per-guild)
 ## Done summary
-TBD
+## Task .3 Complete: Discord Bot Core + Slash Commands
 
+**Files:** discord_claude/bot.py (new), discord_claude/__main__.py (updated entry point)
+
+**Features:**
+- ClaudeBot with message_content intent, CommandTree
+- tree.sync() in setup_hook (per-guild when GUILD_ID set)
+- /claude-attach: finds/creates tmux session + Discord channel in project category
+- /claude-start: creates new session, errors if exists
+- /claude-list: embed with all active session↔channel mappings
+- on_message: routes to pipe input queue, terminal mode with $ prefix + user allowlist
+- All commands use defer() + followup
+- Auto-creates categories per project name
+- Also includes management commands (task .4): /claude-stop, /delete-channel, /cleanup-category
+- Reconnection on startup: re-discovers tmux sessions, re-attaches pipes
 ## Evidence
 - Commits:
-- Tests:
+- Tests: Bot module imports, All 6 commands registered: claude-attach, claude-start, claude-list, claude-stop, delete-channel, cleanup-category
 - PRs:

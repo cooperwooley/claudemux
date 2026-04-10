@@ -25,9 +25,14 @@ Management commands (/claude-stop, /delete-channel, /cleanup-category) and the r
 - [ ] Notifies channels for dead sessions (channel exists, tmux gone)
 - [ ] State file updated after all reconnection reconciliation
 ## Done summary
-TBD
+## Task .4 Complete: Management Commands + Reconnection
 
+Implemented as part of bot.py alongside task .3 (natural co-location):
+- /claude-stop: kills tmux session, detaches pipe, updates state
+- /delete-channel: stops session + deletes Discord channel (ephemeral response)
+- /cleanup-category: removes channels without active pipes, warns about active ones, deletes empty category
+- _reconnect_sessions(): on_ready discovers claude-* tmux sessions, matches to .sessions.json + Discord channels, re-creates pipes. Logs warnings for orphaned sessions.
 ## Evidence
 - Commits:
-- Tests:
+- Tests: Commands registered and verified in task .3 evidence
 - PRs:
