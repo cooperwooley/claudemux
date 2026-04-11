@@ -83,7 +83,7 @@ class SessionManager:
             "-s", name,
             "-c", workspace,
             "-x", "220", "-y", "50",
-            "claude",
+            "claude", "--dangerously-skip-permissions",
         )
         if rc != 0:
             raise RuntimeError(f"tmux new-session failed: {stderr.strip()}")
@@ -122,11 +122,14 @@ class SessionManager:
 
         return await self.create_session(project, feature, workspace)
 
-    async def send_keys(self, name: str, text: str) -> None:
+    async def send_keys(self, name: str, text: str, *, enter: bool = True) -> None:
         """Send keystrokes to a tmux session pane."""
         if not await self.has_session(name):
             raise RuntimeError(f"tmux session '{name}' does not exist")
-        await self._run("send-keys", "-t", name, text, "Enter")
+        args = ["send-keys", "-t", name, text]
+        if enter:
+            args.append("Enter")
+        await self._run(*args)
 
     async def capture_pane(self, name: str) -> str:
         """Return the current visible content of a tmux pane."""

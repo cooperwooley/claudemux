@@ -35,9 +35,48 @@ _ANSI_RE = re.compile(
 
 MAX_MSG_LEN = 1900  # leave room for code block markers + buffer
 
+# Lines made entirely of box-drawing / decoration characters (with optional whitespace)
+_DECORATION_LINE = re.compile(
+    r"^\s*[─━═╌╍┄┅╴╶╸╺│┃║╎╏┆┇╵╷╹╻"
+    r"┌┍┎┏┐┑┒┓└┕┖┗┘┙┚┛├┝┞┟┠┡┢┣┤┥┦┧┨┩┪┫"
+    r"┬┭┮┯┰┱┲┳┴┵┶┷┸┹┺┻┼┽┾┿╀╁╂╃╄╅╆╇╈╉╊╋"
+    r"╔╗╚╝╠╣╦╩╬╭╮╯╰╱╲╳]+\s*$"
+)
+
+# Claude Code status bar patterns (bottom of pane)
+_STATUS_PATTERNS = [
+    re.compile(r"^\s*⏵⏵\s"),                        # bypass permissions indicator
+    re.compile(r"^\s*❯\s*$"),                         # empty input prompt
+    re.compile(r"\(shift\+tab to cycle\)"),            # mode switcher hint
+    re.compile(r"\(ctrl\+o to expand\)"),              # expandable section hint
+    re.compile(r"^\s*\d+[.,]\d+[kKmM]?\s+tokens"),    # token counter
+    re.compile(r"^\s*claude-?\d"),                     # model name line
+]
+
 
 def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
+
+
+def clean_tui_chrome(text: str) -> str:
+    """Remove Claude Code TUI decorations that look bad in Discord."""
+    lines = text.splitlines()
+    cleaned: list[str] = []
+
+    for line in lines:
+        # Skip pure decoration lines (horizontal rules)
+        if _DECORATION_LINE.match(line):
+            continue
+        # Skip status bar patterns
+        if any(p.search(line) for p in _STATUS_PATTERNS):
+            continue
+        cleaned.append(line)
+
+    result = "\n".join(cleaned)
+    # Collapse runs of blank lines
+    while "\n\n\n" in result:
+        result = result.replace("\n\n\n", "\n\n")
+    return result.strip()
 
 
 def chunk_output(text: str) -> list[str]:
@@ -71,12 +110,14 @@ class SessionPipe:
         *,
         poll_interval: float = 1.0,
         quiet_timeout: float = 3.0,
+        notify_user_ids: frozenset[int] = frozenset(),
     ) -> None:
         self.session_name = session_name
         self.channel = channel
         self.manager = manager
         self.poll_interval = poll_interval
         self.quiet_timeout = quiet_timeout
+        self._notify_user_ids = notify_user_ids
 
         # State
         self._last_snapshot: str = ""
@@ -138,7 +179,14 @@ class SessionPipe:
     # ── Output (tmux → Discord) ──────────────────────────────────────
 
     async def _poll_loop(self) -> None:
-        """Poll tmux pane, detect changes, push to Discord."""
+        """Poll tmux pane, detect changes, push to Discord.
+
+        Strategy: capture the full visible pane each tick.  When content
+        changes, replace the live message with the latest pane snapshot
+        (trimmed to the last ~1900 chars).  After *quiet_timeout* seconds
+        of no change the message is finalised and the next change starts
+        a fresh message.
+        """
         try:
             while not self._stopped:
                 await asyncio.sleep(self.poll_interval)
@@ -149,7 +197,7 @@ class SessionPipe:
                         await self._notify_death("tmux session ended")
                     return
 
-                clean = strip_ansi(raw).rstrip()
+                clean = clean_tui_chrome(strip_ansi(raw))
 
                 if clean == self._last_snapshot:
                     # No change — check if we should finalize
@@ -161,63 +209,25 @@ class SessionPipe:
                         await self._finalize_message()
                     continue
 
-                # Compute the new content (diff from last snapshot)
-                new_content = self._compute_diff(self._last_snapshot, clean)
                 self._last_snapshot = clean
-
-                if new_content:
-                    self._live_buffer += new_content + "\n"
-                    self._last_change = time.monotonic()
-                    await self._update_live_message()
+                # Show the tail of the pane (most relevant output)
+                self._live_buffer = clean
+                self._last_change = time.monotonic()
+                await self._update_live_message()
 
         except asyncio.CancelledError:
             return
 
-    def _compute_diff(self, old: str, new: str) -> str:
-        """Return lines in *new* that weren't in *old*."""
-        old_lines = old.splitlines()
-        new_lines = new.splitlines()
-
-        # Find the longest common suffix between old and new to detect new output.
-        # Simple approach: find where new content diverges from old.
-        if not old_lines:
-            return "\n".join(new_lines)
-
-        # Find lines in new that extend beyond old
-        # Compare from the end to handle scrolling
-        overlap = 0
-        for i in range(min(len(old_lines), len(new_lines))):
-            if old_lines[-(i + 1)] == new_lines[-(i + 1)]:
-                overlap = i + 1
-            else:
-                break
-
-        if overlap == 0:
-            # Completely different content — show all new
-            return "\n".join(new_lines)
-
-        # New lines are everything before the overlapping suffix
-        new_start = len(new_lines) - overlap
-        if new_start <= len(old_lines) - overlap:
-            # No actual new content, just scrolling
-            return ""
-
-        # This is a simplification — just show the full new pane content
-        # when it differs, trimmed of leading blank lines
-        diff_lines = new_lines[: len(new_lines) - overlap] if overlap < len(new_lines) else new_lines
-        return "\n".join(line for line in diff_lines if line.strip())
-
     async def _update_live_message(self) -> None:
-        """Edit the live message with current buffer, or send a new one."""
+        """Edit the live message with the latest pane snapshot."""
         if not self._live_buffer.strip():
             return
 
-        chunks = chunk_output(self._live_buffer.strip())
-        if not chunks:
-            return
-
-        # Use only the last chunk for the live message (most recent output)
-        display = chunks[-1]
+        # Trim to tail to fit Discord's limit
+        text = self._live_buffer.strip()
+        if len(text) > MAX_MSG_LEN:
+            text = "...\n" + text[-(MAX_MSG_LEN - 5):]
+        display = f"```\n{text}\n```"
 
         try:
             if self._live_message is not None:
@@ -248,6 +258,14 @@ class SessionPipe:
                     await self.channel.send(chunk)
         except Exception:
             log.exception("Failed to finalize message in #%s", self.channel.name)
+
+        # Ping users that the response is ready
+        if self._notify_user_ids:
+            mentions = " ".join(f"<@{uid}>" for uid in self._notify_user_ids)
+            try:
+                await self.channel.send(mentions, silent=False)
+            except Exception:
+                log.exception("Failed to send ping in #%s", self.channel.name)
 
         self._live_buffer = ""
         self._live_message = None

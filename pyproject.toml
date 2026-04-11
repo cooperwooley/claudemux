@@ -1,7 +1,7 @@
 [project]
-name = "discord-claude"
+name = "claudemux"
 version = "0.1.0"
-description = "Discord bot that orchestrates multiple Claude Code CLI instances via tmux"
+description = "Multiplex Claude Code CLI sessions through Discord via tmux"
 requires-python = ">=3.11"
 dependencies = [
     "discord.py>=2.3",
@@ -9,7 +9,7 @@ dependencies = [
 ]
 
 [project.scripts]
-discord-claude = "discord_claude.__main__:main"
+claudemux = "discord_claude.__main__:main"
 
 [build-system]
 requires = ["setuptools>=68"]

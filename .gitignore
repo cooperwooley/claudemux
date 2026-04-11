@@ -6,4 +6,7 @@ dist/
 build/
 .env
 .sessions.json
+.workspaces.json
 .venv/
+.flow/
+tasks/

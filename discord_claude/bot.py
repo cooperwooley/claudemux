@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import discord
 from discord import app_commands
 
-from .config import Settings, resolve_workspace, sanitize_name, session_name, WORKSPACES
+from .config import Settings, WorkspaceRegistry, sanitize_name, session_name
 from .pipe import PipeRegistry, SessionPipe
 from .session_manager import SessionManager
 
@@ -24,11 +25,40 @@ class ClaudeBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.manager = SessionManager(settings)
         self.pipes = PipeRegistry()
+        self.workspaces = WorkspaceRegistry()
         self._guild_obj: discord.Object | None = (
             discord.Object(id=settings.guild_id) if settings.guild_id else None
         )
 
         self._register_commands()
+        self._register_error_handler()
+
+    # ── Global error handler ───────────────────────────────────────
+
+    def _register_error_handler(self) -> None:
+        @self.tree.error
+        async def on_app_command_error(
+            interaction: discord.Interaction,
+            error: app_commands.AppCommandError,
+        ) -> None:
+            original = getattr(error, "original", error)
+            log.error("Command '%s' failed: %s", interaction.command and interaction.command.name, original)
+
+            msg = f"**Error:** {original}"
+            if isinstance(original, discord.Forbidden):
+                msg = (
+                    "**Missing Permissions.** The bot needs **Manage Channels**, "
+                    "**Send Messages**, **Read Message History**, **Embed Links**, "
+                    "and **Add Reactions**. Re-invite with the correct permissions."
+                )
+
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+            except Exception:
+                log.exception("Failed to send error response")
 
     # ── Setup ────────────────────────────────────────────────────────
 
@@ -64,7 +94,6 @@ class ClaudeBot(discord.Client):
             if message.author.id not in self.settings.allowed_user_ids:
                 await message.reply("You are not authorised to run shell commands.")
                 return
-            # Send the raw shell command (without the `$ ` prefix)
             await pipe.enqueue_input(text[2:])
             await message.add_reaction("\u2705")
             return
@@ -76,14 +105,13 @@ class ClaudeBot(discord.Client):
     # ── Helpers ──────────────────────────────────────────────────────
 
     async def _get_or_create_category(
-        self, guild: discord.Guild, project: str
+        self, guild: discord.Guild, name: str
     ) -> discord.CategoryChannel:
-        """Find or create a category named after the project."""
-        display = project.replace("-", " ").title()
+        """Find or create a category by display name."""
         for cat in guild.categories:
-            if cat.name.lower() == display.lower():
+            if cat.name.lower() == name.lower():
                 return cat
-        return await guild.create_category(display)
+        return await guild.create_category(name)
 
     async def _create_pipe(
         self,
@@ -96,6 +124,7 @@ class ClaudeBot(discord.Client):
             manager=self.manager,
             poll_interval=self.settings.poll_interval,
             quiet_timeout=self.settings.quiet_timeout,
+            notify_user_ids=self.settings.allowed_user_ids,
         )
         self.pipes.register(pipe)
         pipe.start()
@@ -136,13 +165,13 @@ class ClaudeBot(discord.Client):
             description="Attach to an existing Claude session or create a new one",
         )
         @app_commands.describe(
-            project="Project name (e.g. tex-pilot, forge)",
-            channel_name="Feature/task name for the channel",
+            project="Project path (e.g. myorg/backend, tools/cli-app, personal/my-project)",
+            feature="Feature/task name for the channel",
         )
         async def claude_attach(
             interaction: discord.Interaction,
             project: str,
-            channel_name: str,
+            feature: str,
         ) -> None:
             await interaction.response.defer()
 
@@ -151,22 +180,28 @@ class ClaudeBot(discord.Client):
                 await interaction.followup.send("This command only works in a server.")
                 return
 
-            project_slug = sanitize_name(project)
-            feature_slug = sanitize_name(channel_name)
+            # Resolve workspace path
+            resolved = self.workspaces.resolve(project)
+            if resolved is None:
+                await interaction.followup.send(
+                    f"Could not find project `{project}` in any base directory.\n"
+                    f"Registered base dirs: {', '.join(f'`{p}`' for p in self.workspaces.base_dirs)}\n"
+                    f"Use `/claude-workspace add <path>` to register a new base directory."
+                )
+                return
+
+            workspace_str = str(resolved)
+            project_slug = sanitize_name(project.replace("/", "-"))
+            feature_slug = sanitize_name(feature)
             sname = session_name(self.settings.tmux_prefix, project_slug, feature_slug)
 
-            # Resolve workspace
-            workspace = resolve_workspace(project_slug)
-            workspace_str = str(workspace) if workspace else f"/home/{__import__('os').getlogin()}"
+            # Discord structure
+            cat_name = self.workspaces.category_name(project)
+            ch_name = self.workspaces.channel_name(project, feature)
 
-            # Get or create Discord category + channel
-            category = await self._get_or_create_category(guild, project_slug)
-            # Check if channel already exists
-            existing_ch = discord.utils.get(category.text_channels, name=feature_slug)
-            if existing_ch:
-                channel = existing_ch
-            else:
-                channel = await guild.create_text_channel(feature_slug, category=category)
+            category = await self._get_or_create_category(guild, cat_name)
+            existing_ch = discord.utils.get(category.text_channels, name=ch_name)
+            channel = existing_ch or await guild.create_text_channel(ch_name, category=category)
 
             # Attach or create tmux session
             info = await self.manager.attach_session(project_slug, feature_slug, workspace_str)
@@ -189,13 +224,13 @@ class ClaudeBot(discord.Client):
             description="Start a new Claude session (errors if one already exists)",
         )
         @app_commands.describe(
-            project="Project name (e.g. tex-pilot, forge)",
-            channel_name="Feature/task name for the channel",
+            project="Project path (e.g. myorg/backend, personal/my-project)",
+            feature="Feature/task name for the channel",
         )
         async def claude_start(
             interaction: discord.Interaction,
             project: str,
-            channel_name: str,
+            feature: str,
         ) -> None:
             await interaction.response.defer()
 
@@ -204,8 +239,17 @@ class ClaudeBot(discord.Client):
                 await interaction.followup.send("This command only works in a server.")
                 return
 
-            project_slug = sanitize_name(project)
-            feature_slug = sanitize_name(channel_name)
+            resolved = self.workspaces.resolve(project)
+            if resolved is None:
+                await interaction.followup.send(
+                    f"Could not find project `{project}` in any base directory.\n"
+                    f"Use `/claude-workspace add <path>` to register a new base directory."
+                )
+                return
+
+            workspace_str = str(resolved)
+            project_slug = sanitize_name(project.replace("/", "-"))
+            feature_slug = sanitize_name(feature)
             sname = session_name(self.settings.tmux_prefix, project_slug, feature_slug)
 
             if await self.manager.has_session(sname):
@@ -214,11 +258,11 @@ class ClaudeBot(discord.Client):
                 )
                 return
 
-            workspace = resolve_workspace(project_slug)
-            workspace_str = str(workspace) if workspace else f"/home/{__import__('os').getlogin()}"
+            cat_name = self.workspaces.category_name(project)
+            ch_name = self.workspaces.channel_name(project, feature)
 
-            category = await self._get_or_create_category(guild, project_slug)
-            channel = await guild.create_text_channel(feature_slug, category=category)
+            category = await self._get_or_create_category(guild, cat_name)
+            channel = await guild.create_text_channel(ch_name, category=category)
 
             info = await self.manager.create_session(project_slug, feature_slug, workspace_str)
             self.manager.update_channel_id(sname, channel.id)
@@ -261,7 +305,7 @@ class ClaudeBot(discord.Client):
             description="Stop a Claude session and detach the pipe",
         )
         @app_commands.describe(
-            session="Session name (e.g. claude-tex-pilot-auth-refactor)",
+            session="Session name (e.g. claude-backend-auth-refactor)",
         )
         async def claude_stop(
             interaction: discord.Interaction,
@@ -291,7 +335,6 @@ class ClaudeBot(discord.Client):
         ) -> None:
             await interaction.response.defer(ephemeral=True)
 
-            # Find and stop any pipe attached to this channel
             pipe = self.pipes.get_by_channel(channel.id)
             if pipe:
                 await self.pipes.remove(pipe.session_name)
@@ -338,7 +381,6 @@ class ClaudeBot(discord.Client):
                     await ch.delete(reason="Cleanup: no active session")
                     deleted.append(ch.name)
 
-            # Delete category if fully empty
             if not active and not category.text_channels:
                 await category.delete(reason="Cleanup: empty category")
                 msg = f"Deleted category '{display}' and {len(deleted)} channel(s)."
@@ -353,6 +395,80 @@ class ClaudeBot(discord.Client):
                 msg = "\n".join(msg_parts) or "Nothing to clean up."
 
             await interaction.followup.send(msg)
+
+        # ── Workspace management ─────────────────────────────────────
+
+        workspace_group = app_commands.Group(
+            name="claude-workspace",
+            description="Manage project base directories",
+        )
+
+        @workspace_group.command(
+            name="add",
+            description="Register a base directory for project discovery",
+        )
+        @app_commands.describe(path="Absolute path to a base directory (e.g. /home/you/projects)")
+        async def workspace_add(interaction: discord.Interaction, path: str) -> None:
+            p = Path(path).expanduser().resolve()
+            if self.workspaces.add_base_dir(p):
+                await interaction.response.send_message(
+                    f"Added base directory: `{p}`\n"
+                    f"All base dirs: {', '.join(f'`{d}`' for d in self.workspaces.base_dirs)}"
+                )
+            else:
+                if not p.is_dir():
+                    await interaction.response.send_message(f"`{p}` is not a valid directory.")
+                else:
+                    await interaction.response.send_message(f"`{p}` is already registered.")
+
+        @workspace_group.command(
+            name="remove",
+            description="Remove a base directory from project discovery",
+        )
+        @app_commands.describe(path="Path to remove")
+        async def workspace_remove(interaction: discord.Interaction, path: str) -> None:
+            p = Path(path).expanduser().resolve()
+            if self.workspaces.remove_base_dir(p):
+                await interaction.response.send_message(
+                    f"Removed base directory: `{p}`\n"
+                    f"Remaining: {', '.join(f'`{d}`' for d in self.workspaces.base_dirs) or 'none'}"
+                )
+            else:
+                await interaction.response.send_message(f"`{p}` is not a registered base directory.")
+
+        @workspace_group.command(
+            name="list",
+            description="Show all registered base directories and discoverable projects",
+        )
+        async def workspace_list(interaction: discord.Interaction) -> None:
+            await interaction.response.defer()
+
+            dirs = self.workspaces.base_dirs
+            if not dirs:
+                await interaction.followup.send("No base directories registered.")
+                return
+
+            embed = discord.Embed(
+                title="Workspace Base Directories",
+                color=discord.Color.green(),
+            )
+            for base in dirs:
+                # List immediate children as discoverable projects
+                if base.is_dir():
+                    children = sorted(
+                        p.name for p in base.iterdir()
+                        if p.is_dir() and not p.name.startswith(".")
+                    )
+                    value = ", ".join(f"`{c}`" for c in children[:15]) if children else "*empty*"
+                    if len(children) > 15:
+                        value += f" ... +{len(children) - 15} more"
+                else:
+                    value = "*directory not found*"
+                embed.add_field(name=str(base), value=value, inline=False)
+
+            await interaction.followup.send(embed=embed)
+
+        self.tree.add_command(workspace_group)
 
 
 def run_bot(settings: Settings) -> None:
