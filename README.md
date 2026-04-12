@@ -98,7 +98,24 @@ Discord channel  <──messages──>  claudemux bot  <──tmux pipe──> 
 
 - **Normal messages** in a session channel are sent to Claude Code as prompts
 - **`$ <command>`** prefix runs a raw shell command in the tmux session (restricted to allowed users)
+- **`^<key>`** prefix sends special keys for navigating interactive TUI prompts (menus, selections, etc.)
 - **Bot messages** are ignored to prevent loops
+
+### Special key commands
+
+Interactive prompts (like arrow-key menus) can't be navigated with normal text messages. Use the `^` prefix to send special keys:
+
+| Command | Action |
+|---|---|
+| `^1` through `^9` | Select menu option N (sends N-1 Down arrows + Enter) |
+| `^esc` | Escape (quit a menu or prompt) |
+| `^up` / `^down` | Arrow keys (manual navigation) |
+| `^left` / `^right` | Arrow keys |
+| `^tab` | Tab |
+| `^enter` | Enter (confirm default selection) |
+| `^space` | Space (toggle checkboxes) |
+| `^y` / `^n` | Answer yes/no prompts |
+| `^backspace` | Backspace |
 
 ## Architecture
 
