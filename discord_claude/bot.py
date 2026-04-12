@@ -77,6 +77,22 @@ class ClaudeBot(discord.Client):
 
     # ── Message routing ──────────────────────────────────────────────
 
+    # Map of ^-prefix names to tmux key names
+    _SPECIAL_KEYS: dict[str, str] = {
+        "esc": "Escape",
+        "escape": "Escape",
+        "up": "Up",
+        "down": "Down",
+        "left": "Left",
+        "right": "Right",
+        "tab": "Tab",
+        "enter": "Enter",
+        "space": "Space",
+        "backspace": "BSpace",
+        "y": "y",
+        "n": "n",
+    }
+
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot:
             return
@@ -96,6 +112,31 @@ class ClaudeBot(discord.Client):
                 return
             await pipe.enqueue_input(text[2:])
             await message.add_reaction("\u2705")
+            return
+
+        # Special-key mode: `^<key>` for interactive prompts
+        if text.startswith("^"):
+            arg = text[1:].strip().lower()
+
+            # ^1-^9 → select menu option N (send N-1 Down arrows + Enter)
+            if arg.isdigit() and 1 <= int(arg) <= 9:
+                n = int(arg)
+                keys = ["Down"] * (n - 1) + ["Enter"]
+                await pipe.enqueue_special_keys(*keys)
+                await message.add_reaction("\U0001f3af")  # dart
+                return
+
+            # Named keys: ^esc, ^up, ^down, ^tab, etc.
+            tmux_key = self._SPECIAL_KEYS.get(arg)
+            if tmux_key:
+                await pipe.enqueue_special_keys(tmux_key)
+                await message.add_reaction("\U0001f3af")  # dart
+                return
+
+            await message.reply(
+                "Unknown key. Use `^1`-`^9` for menu selection, "
+                "or `^esc` `^up` `^down` `^tab` `^enter` `^y` `^n`."
+            )
             return
 
         # Normal mode: send to Claude

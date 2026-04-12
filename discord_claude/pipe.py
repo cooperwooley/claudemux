@@ -160,15 +160,24 @@ class SessionPipe:
 
     async def enqueue_input(self, text: str) -> None:
         """Add a message to the input queue for sequential delivery."""
-        await self._input_queue.put(text)
+        await self._input_queue.put(("text", text))
+
+    async def enqueue_special_keys(self, *keys: str) -> None:
+        """Add special key presses (e.g. Down, Escape) to the input queue."""
+        await self._input_queue.put(("keys", keys))
 
     async def _input_loop(self) -> None:
         """Consume queued messages and send to tmux one at a time."""
         try:
             while not self._stopped:
-                text = await self._input_queue.get()
+                kind, payload = await self._input_queue.get()
                 try:
-                    await self.manager.send_keys(self.session_name, text)
+                    if kind == "keys":
+                        await self.manager.send_special_keys(
+                            self.session_name, *payload,
+                        )
+                    else:
+                        await self.manager.send_keys(self.session_name, payload)
                 except RuntimeError as e:
                     log.error("send_keys failed for %s: %s", self.session_name, e)
                     await self._notify_death(str(e))

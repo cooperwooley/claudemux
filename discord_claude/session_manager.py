@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -78,12 +79,16 @@ class SessionManager:
         if await self.has_session(name):
             raise RuntimeError(f"tmux session '{name}' already exists")
 
+        claude_bin = shutil.which("claude")
+        if claude_bin is None:
+            raise RuntimeError("'claude' not found on PATH")
+
         rc, _, stderr = await self._run(
             "new-session", "-d",
             "-s", name,
             "-c", workspace,
             "-x", "220", "-y", "50",
-            "claude", "--dangerously-skip-permissions",
+            claude_bin, "--dangerously-skip-permissions",
         )
         if rc != 0:
             raise RuntimeError(f"tmux new-session failed: {stderr.strip()}")
@@ -130,6 +135,13 @@ class SessionManager:
         if enter:
             args.append("Enter")
         await self._run(*args)
+
+    async def send_special_keys(self, name: str, *keys: str) -> None:
+        """Send raw tmux key names (Down, Up, Escape, Enter, etc.)."""
+        if not await self.has_session(name):
+            raise RuntimeError(f"tmux session '{name}' does not exist")
+        for key in keys:
+            await self._run("send-keys", "-t", name, key)
 
     async def capture_pane(self, name: str) -> str:
         """Return the current visible content of a tmux pane."""
