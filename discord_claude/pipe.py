@@ -170,8 +170,9 @@ class SessionPipe:
         """Consume queued messages and send to tmux one at a time."""
         try:
             while not self._stopped:
-                kind, payload = await self._input_queue.get()
+                item = await self._input_queue.get()
                 try:
+                    kind, payload = item
                     if kind == "keys":
                         await self.manager.send_special_keys(
                             self.session_name, *payload,
@@ -182,6 +183,8 @@ class SessionPipe:
                     log.error("send_keys failed for %s: %s", self.session_name, e)
                     await self._notify_death(str(e))
                     return
+                except Exception as e:
+                    log.exception("Unexpected error in input loop for %s", self.session_name)
         except asyncio.CancelledError:
             return
 
@@ -201,8 +204,9 @@ class SessionPipe:
                 await asyncio.sleep(self.poll_interval)
                 try:
                     raw = await self.manager.capture_pane(self.session_name)
-                except RuntimeError:
+                except RuntimeError as e:
                     if not self._stopped:
+                        log.error("Poll capture failed for %s: %s", self.session_name, e)
                         await self._notify_death("tmux session ended")
                     return
 
