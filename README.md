@@ -107,6 +107,7 @@ Interactive prompts (like arrow-key menus) can't be navigated with normal text m
 
 | Command | Action |
 |---|---|
+| `^` | Enter (confirm/submit) |
 | `^1` through `^9` | Select menu option N (sends N-1 Down arrows + Enter) |
 | `^esc` | Escape (quit a menu or prompt) |
 | `^up` / `^down` | Arrow keys (manual navigation) |

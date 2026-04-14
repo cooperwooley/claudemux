@@ -118,6 +118,12 @@ class ClaudeBot(discord.Client):
         if text.startswith("^"):
             arg = text[1:].strip().lower()
 
+            # Bare `^` → Enter
+            if not arg:
+                await pipe.enqueue_special_keys("Enter")
+                await message.add_reaction("\U0001f3af")  # dart
+                return
+
             # ^1-^9 → select menu option N (send N-1 Down arrows + Enter)
             if arg.isdigit() and 1 <= int(arg) <= 9:
                 n = int(arg)
@@ -134,8 +140,8 @@ class ClaudeBot(discord.Client):
                 return
 
             await message.reply(
-                "Unknown key. Use `^1`-`^9` for menu selection, "
-                "or `^esc` `^up` `^down` `^tab` `^enter` `^y` `^n`."
+                "Unknown key. Use `^` for Enter, `^1`-`^9` for menu selection, "
+                "or `^esc` `^up` `^down` `^tab` `^y` `^n`."
             )
             return
 
