@@ -128,13 +128,17 @@ class SessionManager:
         return await self.create_session(project, feature, workspace)
 
     async def send_keys(self, name: str, text: str, *, enter: bool = True) -> None:
-        """Send keystrokes to a tmux session pane."""
+        """Send keystrokes to a tmux session pane.
+
+        Uses -l (literal) so tmux never interprets message text as key
+        names (e.g. "Escape", "Space").  Enter is sent as a separate
+        command so the TUI has time to process the text first.
+        """
         if not await self.has_session(name):
             raise RuntimeError(f"tmux session '{name}' does not exist")
-        args = ["send-keys", "-t", name, text]
+        await self._run("send-keys", "-t", name, "-l", text)
         if enter:
-            args.append("Enter")
-        await self._run(*args)
+            await self._run("send-keys", "-t", name, "Enter")
 
     async def send_special_keys(self, name: str, *keys: str) -> None:
         """Send raw tmux key names (Down, Up, Escape, Enter, etc.)."""
