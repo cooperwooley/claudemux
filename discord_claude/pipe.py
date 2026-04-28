@@ -304,7 +304,15 @@ class PipeRegistry:
         self._by_channel: dict[int, SessionPipe] = {}
         self._by_session: dict[str, SessionPipe] = {}
 
-    def register(self, pipe: SessionPipe) -> None:
+    async def register(self, pipe: SessionPipe) -> None:
+        # Stop any existing pipe for this session to prevent duplicates
+        old = self._by_session.get(pipe.session_name)
+        if old is not None:
+            log.warning(
+                "Replacing existing pipe for session %s — stopping old pipe",
+                pipe.session_name,
+            )
+            await old.stop()
         self._by_channel[pipe.channel.id] = pipe
         self._by_session[pipe.session_name] = pipe
 
