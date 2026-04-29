@@ -93,6 +93,18 @@ class SessionManager:
         if rc != 0:
             raise RuntimeError(f"tmux new-session failed: {stderr.strip()}")
 
+        # Bump per-session history-limit so capture-pane -S -<N> can
+        # actually return N lines of scrollback. Failure is non-fatal —
+        # we just get a smaller scrollback window than intended.
+        rc_hl, _, stderr_hl = await self._run(
+            "set-option", "-t", name, "history-limit", "5000",
+        )
+        if rc_hl != 0:
+            log.warning(
+                "could not set history-limit on %s: %s",
+                name, stderr_hl.strip(),
+            )
+
         info = SessionInfo(
             session_name=name,
             project=sanitize_name(project),
@@ -147,10 +159,18 @@ class SessionManager:
         for key in keys:
             await self._run("send-keys", "-t", name, key)
 
-    async def capture_pane(self, name: str) -> str:
-        """Return the current visible content of a tmux pane."""
+    async def capture_pane(
+        self, name: str, *, scrollback_lines: int = 2000,
+    ) -> str:
+        """Return pane content including the last *scrollback_lines* of history.
+
+        tmux silently clamps ``-S -<N>`` to whatever ``history-limit`` is set
+        to, so callers must ensure the session was created with a large
+        enough buffer (see :meth:`create_session`).
+        """
         rc, stdout, stderr = await self._run(
             "capture-pane", "-t", name, "-p", "-e",
+            "-S", f"-{scrollback_lines}",
         )
         if rc != 0:
             raise RuntimeError(f"capture-pane failed: {stderr.strip()}")
