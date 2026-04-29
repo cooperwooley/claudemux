@@ -3,7 +3,9 @@
 Handles:
 - Output polling via capture-pane with diff-based change detection
 - ANSI escape code stripping
-- Rate-limit-safe output via edit-in-place (one "live" message)
+- Rate-limit-safe output via a rolling-page model: edit one "active" page
+  in place; when it would overflow, freeze it and start a new page so
+  the full transcript stays scrollable in Discord.
 - Input queuing (sequential send-keys to prevent interleaving)
 - Graceful session death detection
 """
@@ -34,6 +36,11 @@ _ANSI_RE = re.compile(
 )
 
 MAX_MSG_LEN = 1900  # leave room for code block markers + buffer
+
+# Headroom inside a single Discord message after the surrounding code-block
+# fence (```\n…\n```) is added. Splitting at MAX_BODY keeps the rendered
+# message under MAX_MSG_LEN.
+MAX_BODY = MAX_MSG_LEN - len("```\n\n```")  # ≈ 1892
 
 # Cap on how much of *prev* we suffix-search against *curr* in _compute_new_text.
 # 4 KB is far larger than typical single-poll deltas yet keeps the search cheap.
@@ -154,25 +161,6 @@ def _compute_new_text(prev: str, curr: str) -> str:
     return curr_n
 
 
-def chunk_output(text: str) -> list[str]:
-    """Split *text* into chunks that fit inside a Discord code block."""
-    if not text:
-        return []
-
-    chunks: list[str] = []
-    while text:
-        if len(text) <= MAX_MSG_LEN:
-            chunks.append(f"```\n{text}\n```")
-            break
-        # Find a newline near the boundary to avoid mid-line splits
-        cut = text.rfind("\n", 0, MAX_MSG_LEN)
-        if cut == -1:
-            cut = MAX_MSG_LEN
-        chunks.append(f"```\n{text[:cut]}\n```")
-        text = text[cut:].lstrip("\n")
-    return chunks
-
-
 # ── Session pipe ─────────────────────────────────────────────────────
 class SessionPipe:
     """Manages bidirectional I/O between one tmux session and one Discord channel."""
@@ -196,8 +184,15 @@ class SessionPipe:
 
         # State
         self._last_snapshot: str = ""
-        self._live_message: discord.Message | None = None
-        self._live_buffer: str = ""
+        # Accumulated cleaned output for the current turn (since the last
+        # finalize). Useful for diagnostics; not currently re-rendered.
+        self._transcript: str = ""
+        # The Discord message currently being edited in place. Frozen pages
+        # (older messages in the channel) are never referenced again.
+        self._active_page: discord.Message | None = None
+        # Body text rendered into _active_page (without code-block fences),
+        # capped at MAX_BODY before we freeze and roll to a new page.
+        self._active_page_text: str = ""
         self._last_change: float = 0.0
         self._input_queue: asyncio.Queue[str] = asyncio.Queue()
         self._poll_task: asyncio.Task | None = None
@@ -227,8 +222,8 @@ class SessionPipe:
                     pass
         self._poll_task = None
         self._input_task = None
-        # Finalize any pending live message
-        await self._finalize_message()
+        # Lock the in-flight active page (if any) and ping users.
+        await self._finalize_turn()
         log.info("Pipe stopped for %s", self.session_name)
 
     # ── Input (Discord → tmux) ───────────────────────────────────────
@@ -266,13 +261,14 @@ class SessionPipe:
     # ── Output (tmux → Discord) ──────────────────────────────────────
 
     async def _poll_loop(self) -> None:
-        """Poll tmux pane, detect changes, push to Discord.
+        """Poll tmux pane, detect changes, push to Discord via rolling pages.
 
-        Strategy: capture the full visible pane each tick.  When content
-        changes, replace the live message with the latest pane snapshot
-        (trimmed to the last ~1900 chars).  After *quiet_timeout* seconds
-        of no change the message is finalised and the next change starts
-        a fresh message.
+        Strategy: capture the full visible pane (plus scrollback) each tick.
+        When content changes, compute the new suffix vs the previous snapshot
+        and append it to the active Discord page. If the page would exceed
+        MAX_BODY, freeze it (no further edits) and start a new active page.
+        After *quiet_timeout* seconds of no change the active page is locked
+        in place and a single ping is sent in a trailing message.
         """
         try:
             while not self._stopped:
@@ -288,75 +284,153 @@ class SessionPipe:
                 clean = clean_tui_chrome(strip_ansi(raw))
 
                 if clean == self._last_snapshot:
-                    # No change — check if we should finalize
+                    # No change — check if we should finalize the active page.
                     if (
-                        self._live_buffer
+                        self._active_page_text
                         and self._last_change > 0
                         and (time.monotonic() - self._last_change) >= self.quiet_timeout
                     ):
-                        await self._finalize_message()
+                        await self._finalize_turn()
                     continue
 
+                new = _compute_new_text(self._last_snapshot, clean)
+                # Always advance _last_snapshot — handles shrink + no-net-content.
                 self._last_snapshot = clean
-                # Show the tail of the pane (most relevant output)
-                self._live_buffer = clean
+                if not new:
+                    continue
+
+                self._transcript += new
+                await self._append_to_active(new)
                 self._last_change = time.monotonic()
-                await self._update_live_message()
 
         except asyncio.CancelledError:
             return
 
-    async def _update_live_message(self) -> None:
-        """Edit the live message with the latest pane snapshot."""
-        if not self._live_buffer.strip():
+    async def _append_to_active(self, new: str) -> None:
+        """Append *new* to the active page, rolling to fresh pages as needed.
+
+        Splits at the last newline before MAX_BODY when one exists; falls back
+        to a byte-boundary cut only when no newline appears in the would-be
+        page tail. After freezing a page, the leading newline that joined the
+        old content to the new content is stripped so the next page does not
+        start with a blank line.
+        """
+        # Roll forward as long as the next chunk would overflow the active page.
+        while self._active_page_text and len(self._active_page_text) + len(new) > MAX_BODY:
+            take = MAX_BODY - len(self._active_page_text)
+            cut = new.rfind("\n", 0, take)
+            if cut <= 0:
+                # No newline in the tail — fall back to byte boundary.
+                cut = take
+            self._active_page_text += new[:cut]
+            await self._flush_active(final=True)
+            self._active_page = None
+            self._active_page_text = ""
+            new = new[cut:].lstrip("\n")
+            if not new:
+                return
+
+        # First-page case: an empty active_page_text and a single delta larger
+        # than MAX_BODY (rare, but possible on the very first poll of a long
+        # turn). Slice it the same way before opening the page.
+        while len(new) > MAX_BODY:
+            take = MAX_BODY
+            cut = new.rfind("\n", 0, take)
+            if cut <= 0:
+                cut = take
+            self._active_page_text = new[:cut]
+            await self._flush_active(final=True)
+            self._active_page = None
+            self._active_page_text = ""
+            new = new[cut:].lstrip("\n")
+            if not new:
+                return
+
+        self._active_page_text += new
+        await self._flush_active(final=False)
+
+    async def _flush_active(self, *, final: bool) -> None:
+        """Render ``_active_page_text`` to Discord as the active page.
+
+        - If no active page exists yet, send a new message and store it.
+        - Otherwise edit the existing message in place.
+        - ``final`` is informational; the caller is responsible for clearing
+          ``_active_page`` after a ``final=True`` flush so the next append
+          opens a fresh message.
+        - Discord errors during edit/send are caught and logged. Forbidden
+          (channel access revoked) stops the pipe; transient HTTP errors are
+          left for the next poll to retry. discord.py auto-respects 429
+          retry-after on both edit and send — we deliberately do not stack a
+          second backoff on top.
+        """
+        if not self._active_page_text.strip():
             return
 
-        # Trim to tail to fit Discord's limit
-        text = self._live_buffer.strip()
-        if len(text) > MAX_MSG_LEN:
-            text = "...\n" + text[-(MAX_MSG_LEN - 5):]
-        display = f"```\n{text}\n```"
+        # Defer the discord import to keep the module test-friendly.
+        import discord
 
+        content = f"```\n{self._active_page_text}\n```"
         try:
-            if self._live_message is not None:
-                await self._live_message.edit(content=display)
+            if self._active_page is None:
+                self._active_page = await self.channel.send(content)
             else:
-                self._live_message = await self.channel.send(display)
-        except Exception:
-            log.exception("Failed to update live message in #%s", self.channel.name)
+                await self._active_page.edit(content=content)
+        except discord.Forbidden:
+            log.error(
+                "Discord Forbidden while flushing page in #%s — stopping pipe",
+                getattr(self.channel, "name", self.channel.id),
+            )
+            self._stopped = True
+        except discord.NotFound:
+            # Channel or message gone; stop trying. Drop the message handle so
+            # any retry would attempt a fresh send rather than edit a tombstone.
+            log.error(
+                "Discord NotFound while flushing page in #%s — stopping pipe",
+                getattr(self.channel, "name", self.channel.id),
+            )
+            self._active_page = None
+            self._stopped = True
+        except discord.HTTPException:
+            log.exception(
+                "Discord HTTP error while flushing page in #%s",
+                getattr(self.channel, "name", self.channel.id),
+            )
 
-    async def _finalize_message(self) -> None:
-        """Finalize the current live message and reset for next response."""
-        if not self._live_buffer.strip():
-            self._live_buffer = ""
-            self._live_message = None
-            return
+    async def _finalize_turn(self) -> None:
+        """Lock the active page in place and ping users for this turn.
 
-        # Send all chunks as final messages
-        chunks = chunk_output(self._live_buffer.strip())
-        try:
-            if self._live_message is not None and chunks:
-                # Update the live message with the first chunk
-                await self._live_message.edit(content=chunks[0])
-                # Send remaining chunks as new messages
-                for chunk in chunks[1:]:
-                    await self.channel.send(chunk)
-            elif chunks:
-                for chunk in chunks:
-                    await self.channel.send(chunk)
-        except Exception:
-            log.exception("Failed to finalize message in #%s", self.channel.name)
+        - The active page is *not* re-edited here (no marker, no reflow per
+          spec) — we simply stop touching it.
+        - If the channel has notify users configured, one ping is sent in a
+          trailing message below the final page (Discord delivers a real
+          notification only on send, not on edit).
+        - All per-turn state (_transcript, _active_page, _active_page_text,
+          _last_change) is reset. _last_snapshot is intentionally NOT reset
+          so the next turn's diff still anchors on what is currently on
+          screen — turns are conceptual, tmux is continuous.
+        """
+        # Defer import; same rationale as _flush_active.
+        import discord
 
-        # Ping users that the response is ready
-        if self._notify_user_ids:
-            mentions = " ".join(f"<@{uid}>" for uid in self._notify_user_ids)
+        had_active = bool(self._active_page_text.strip())
+        if had_active and self._notify_user_ids:
+            mentions = " ".join(f"<@{uid}>" for uid in sorted(self._notify_user_ids))
             try:
                 await self.channel.send(mentions, silent=False)
-            except Exception:
-                log.exception("Failed to send ping in #%s", self.channel.name)
+            except (discord.Forbidden, discord.NotFound):
+                log.error(
+                    "Discord Forbidden/NotFound while sending ping in #%s",
+                    getattr(self.channel, "name", self.channel.id),
+                )
+            except discord.HTTPException:
+                log.exception(
+                    "Discord HTTP error while sending ping in #%s",
+                    getattr(self.channel, "name", self.channel.id),
+                )
 
-        self._live_buffer = ""
-        self._live_message = None
+        self._transcript = ""
+        self._active_page = None
+        self._active_page_text = ""
         self._last_change = 0.0
 
     async def _notify_death(self, reason: str) -> None:
