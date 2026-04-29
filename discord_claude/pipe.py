@@ -35,6 +35,15 @@ _ANSI_RE = re.compile(
 
 MAX_MSG_LEN = 1900  # leave room for code block markers + buffer
 
+# Cap on how much of *prev* we suffix-search against *curr* in _compute_new_text.
+# 4 KB is far larger than typical single-poll deltas yet keeps the search cheap.
+_DIFF_PREV_TAIL = 4096
+
+# Minimum overlap length before we trust a suffix-of-prev / substring-of-curr match.
+# A short match (e.g. "$ ") can collide with a repeated shell prompt and silently
+# drop output between the two prompts; below this floor we treat as no-overlap.
+_DIFF_MIN_OVERLAP = 32
+
 # Lines made entirely of box-drawing / decoration characters (with optional whitespace)
 _DECORATION_LINE = re.compile(
     r"^\s*[─━═╌╍┄┅╴╶╸╺│┃║╎╏┆┇╵╷╹╻"
@@ -77,6 +86,72 @@ def clean_tui_chrome(text: str) -> str:
     while "\n\n\n" in result:
         result = result.replace("\n\n\n", "\n\n")
     return result.strip()
+
+
+def _strip_trailing_blank_lines(text: str) -> str:
+    """Drop trailing empty lines (tmux pads to pane height) without changing
+    the content we care about. Keeps a single trailing newline if the original
+    body was non-empty so identical content with/without padding compares equal.
+    """
+    stripped = text.rstrip("\n")
+    if not stripped:
+        return ""
+    return stripped
+
+
+def _compute_new_text(prev: str, curr: str) -> str:
+    """Return the suffix of *curr* that should be appended to *prev*.
+
+    Pure function — no Discord/tmux dependencies. Behavior:
+
+    - identical (after stripping trailing blank lines) → ``""``
+    - shrink (``len(curr) < len(prev)``) → ``""`` (TUI redraw, not new content)
+    - empty *prev* → return *curr* (with trailing blank lines normalized)
+    - prefix match (``curr.startswith(prev)``) → everything in *curr* past *prev*
+    - otherwise: find the longest suffix of ``prev`` (capped to the last
+      ``_DIFF_PREV_TAIL`` bytes) that also appears as a substring of *curr*;
+      append everything in *curr* after that overlap.
+    - the overlap must be at least ``_DIFF_MIN_OVERLAP`` chars; shorter matches
+      risk colliding with a repeated shell prompt and dropping content between.
+    - no overlap found → return *curr* in full and log a WARN.
+
+    Trailing blank lines on either side are ignored for diff purposes (tmux
+    pads to pane height, which would otherwise cause spurious diffs). The
+    returned suffix may begin with a newline; callers that split across page
+    boundaries should ``lstrip("\\n")`` at the boundary, not on every append.
+    """
+    prev_n = _strip_trailing_blank_lines(prev)
+    curr_n = _strip_trailing_blank_lines(curr)
+
+    if curr_n == prev_n:
+        return ""
+    if len(curr_n) < len(prev_n):
+        return ""
+    if not prev_n:
+        return curr_n
+    if curr_n.startswith(prev_n):
+        return curr_n[len(prev_n):]
+
+    # Suffix-overlap search: try the longest suffix of prev (up to the last
+    # _DIFF_PREV_TAIL bytes) that occurs anywhere in curr; everything in curr
+    # after the *last* such occurrence is the new content.
+    tail = prev_n[-_DIFF_PREV_TAIL:]
+    max_overlap = min(len(tail), len(curr_n))
+
+    for size in range(max_overlap, _DIFF_MIN_OVERLAP - 1, -1):
+        candidate = tail[-size:]
+        idx = curr_n.rfind(candidate)
+        if idx == -1:
+            continue
+        # Append everything in curr after the matched overlap.
+        return curr_n[idx + size:]
+
+    log.warning(
+        "No suffix overlap >= %d chars between prev (%d) and curr (%d); "
+        "appending full snapshot",
+        _DIFF_MIN_OVERLAP, len(prev_n), len(curr_n),
+    )
+    return curr_n
 
 
 def chunk_output(text: str) -> list[str]:
