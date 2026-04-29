@@ -167,7 +167,7 @@ class ClaudeBot(discord.Client):
             quiet_timeout=self.settings.quiet_timeout,
             notify_user_ids=self.settings.allowed_user_ids,
         )
-        self.pipes.register(pipe)
+        await self.pipes.register(pipe)
         pipe.start()
         return pipe
 
@@ -180,6 +180,12 @@ class ClaudeBot(discord.Client):
             return
 
         for sname in live_sessions:
+            # Skip sessions that already have an active pipe (on_ready can
+            # fire multiple times due to gateway reconnects).
+            if self.pipes.get_by_session(sname) is not None:
+                log.debug("Pipe already exists for %s — skipping", sname)
+                continue
+
             info = self.manager.get_info(sname)
             if info is None or info.channel_id == 0:
                 log.warning("Orphaned tmux session %s (no channel mapping)", sname)

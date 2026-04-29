@@ -129,7 +129,7 @@ discord_claude/
 ```
 
 - **SessionManager** handles all tmux interactions (create, attach, capture-pane, send-keys, kill) via async subprocess — the event loop is never blocked
-- **SessionPipe** polls tmux pane content, diffs against the last snapshot, and updates a single "live" Discord message that gets edited in place (avoiding rate limits). After a quiet period, the message is finalized and a new one starts on the next change
+- **SessionPipe** polls tmux pane content (including scrollback), uses suffix-overlap diffing to detect new output, and appends it to an "active" Discord page that gets edited in place to stay within rate limits. When the active page would overflow Discord's message length limit, it's frozen (no further edits) and a new active page is started, so the full transcript stays scrollable in the channel. After a quiet period the active page is locked in place and a single ping is sent in a trailing message
 - **WorkspaceRegistry** resolves slash-separated project paths (like `myorg/repo-name`) against registered base directories, supporting nested project structures
 - **State persistence** via `.sessions.json` enables automatic reconnection after bot restarts
 
